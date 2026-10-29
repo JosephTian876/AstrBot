@@ -476,6 +476,36 @@ def register_on_llm_response(**kwargs):
     return decorator
 
 
+def register_on_llm_response_intermediate(**kwargs):
+    """当 Agent 一轮工具调用前的 LLM 响应完成时的事件
+
+    与 `on_llm_response` 不同，此钩子只在该响应还请求了工具调用时触发，
+    用于观察“还没有给出最终回复”的那一轮响应。它不会改变流式输出的时机，
+    因此无法撤回或改写已经流式下发的分片；但在非流式模式下，修改后的内容
+    会进入随后的 llm_result 与对话历史。
+
+    Examples:
+    ```py
+    from astrbot.api.provider import LLMResponse
+
+    @on_llm_response_intermediate()
+    async def test(self, event: AstrMessageEvent, response: LLMResponse) -> None:
+        ...
+    ```
+
+    请务必接收两个参数：event, response
+
+    """
+
+    def decorator(awaitable):
+        _ = get_handler_or_create(
+            awaitable, EventType.OnLLMResponseIntermediateEvent, **kwargs
+        )
+        return awaitable
+
+    return decorator
+
+
 def register_on_agent_begin(**kwargs):
     """当 Agent 开始运行时的事件
 

@@ -923,6 +923,23 @@ class ToolLoopAgentRunner(BaseAgentRunner[TContext]):
 
         if not llm_resp.tools_call_name:
             await self._complete_with_assistant_response(llm_resp)
+        else:
+            # The round's text is delivered below, so plugins must be able to
+            # rewrite it before that happens. The tool call decision is already
+            # taken, therefore it is restored afterwards: a response hook cannot
+            # redirect or cancel what the agent is about to execute.
+            tools_call = (
+                llm_resp.tools_call_name,
+                llm_resp.tools_call_args,
+                llm_resp.tools_call_ids,
+            )
+            try:
+                await self.agent_hooks.on_agent_response(self.run_context, llm_resp)
+            except Exception as e:
+                logger.error(f"Error in on_agent_response hook: {e}", exc_info=True)
+            llm_resp.tools_call_name = tools_call[0]
+            llm_resp.tools_call_args = tools_call[1]
+            llm_resp.tools_call_ids = tools_call[2]
 
         # 返回 LLM 结果
         if llm_resp.reasoning_content:

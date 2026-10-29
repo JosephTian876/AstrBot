@@ -340,7 +340,7 @@ async def my_custom_hook_1(
 
 #### On LLM Response Complete
 
-After the LLM request completes, the `on_llm_response` hook is triggered.
+After the agent produces its final reply, the `on_llm_response` hook is triggered. A round whose response still requests a tool call does not trigger it, and is reported through `on_llm_response_intermediate` instead. Aborted runs and runtime errors also trigger this hook once, with a synthetic response.
 
 You can obtain the `ProviderResponse` object and modify it.
 
@@ -357,6 +357,30 @@ async def on_llm_resp(
 ```
 
 > You cannot use yield to send messages here. If you need to send, please use the `event.send()` method directly.
+
+> With streaming output the text has already been delivered when this hook runs, so edits made here change the conversation history and the later `llm_result`, but cannot retract chunks the user has already seen.
+
+#### On Intermediate LLM Response (tool-call round)
+
+> Requires AstrBot version > v4.29.3
+
+When a round's response still requests a tool call, `on_llm_response_intermediate` is triggered after that round's text is produced and before the tools run. It takes the same arguments as `on_llm_response`.
+
+```python
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.provider import LLMResponse
+
+
+@filter.on_llm_response_intermediate()
+async def on_llm_resp_intermediate(
+    self, event: AstrMessageEvent, resp: LLMResponse
+):  # Note there are three parameters
+    print(resp)
+```
+
+> It fires once per tool-call round, so a run with several tool rounds triggers it several times. The final reply is still reported by `on_llm_response`.
+>
+> The round's tool calls have already been decided, so modifying `tools_call_name`, `tools_call_args` or `tools_call_ids` does not change which tool runs.
 
 #### On Agent Begin
 

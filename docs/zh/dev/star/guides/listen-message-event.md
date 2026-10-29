@@ -341,7 +341,7 @@ async def my_custom_hook_1(
 
 #### LLM 请求完成时
 
-在 LLM 请求完成后，会触发 `on_llm_response` 钩子。
+在 Agent 给出最终回复后，会触发 `on_llm_response` 钩子。若某一轮响应还要求调用工具，那一轮不会触发本钩子，而由 `on_llm_response_intermediate` 通知。用户中止或运行出错时，也会以一次合成响应触发本钩子。
 
 可以获取到 `ProviderResponse` 对象，可以对其进行修改。
 
@@ -358,6 +358,30 @@ async def on_llm_resp(
 ```
 
 > 这里不能使用 yield 来发送消息。如需发送，请直接使用 `event.send()` 方法。
+
+> 流式输出时，钩子执行前文本已经下发，因此在这里修改内容只会影响对话历史和随后的 `llm_result`，无法撤回用户已经看到的分片。
+
+#### 工具调用轮次响应完成时
+
+> 适用于 AstrBot 版本 > v4.29.3
+
+当某一轮响应仍然要求调用工具时，该轮文本生成完成、工具执行之前会触发 `on_llm_response_intermediate` 钩子。参数与 `on_llm_response` 相同。
+
+```python
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.provider import LLMResponse
+
+
+@filter.on_llm_response_intermediate()
+async def on_llm_resp_intermediate(
+    self, event: AstrMessageEvent, resp: LLMResponse
+):  # 请注意有三个参数
+    print(resp)
+```
+
+> 一次工具调用轮次触发一次，多次工具调用会触发多次；最终回复仍由 `on_llm_response` 通知。
+>
+> 该轮的工具调用已经决定，因此修改 `tools_call_name`、`tools_call_args`、`tools_call_ids` 不会改变实际执行的工具。
 
 #### Agent 开始运行时
 

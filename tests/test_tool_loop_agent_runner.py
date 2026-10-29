@@ -2398,3 +2398,289 @@ async def test_small_step_budgets_and_reset(
     )
     assert runner._step_budget_used == 0
     assert runner._step_budget_notified == set()
+
+
+class IntermediateHooks(MockHooks):
+    """Records intermediate (tool-call round) and final response hooks."""
+
+    def __init__(self):
+        super().__init__()
+        self.intermediate_texts = []
+        self.done_texts = []
+        self.rewrite_intermediate = None
+        self.clear_tool_calls = False
+        self.raise_in_intermediate = False
+
+    async def on_agent_response(self, run_context, llm_response):
+        self.intermediate_texts.append(llm_response.completion_text)
+        if self.raise_in_intermediate:
+            raise RuntimeError("hook exploded")
+        if self.clear_tool_calls:
+            llm_response.tools_call_name = []
+        if self.rewrite_intermediate:
+            llm_response.completion_text = self.rewrite_intermediate(
+                llm_response.completion_text
+            )
+
+    async def on_agent_done(self, run_context, llm_response):
+        await super().on_agent_done(run_context, llm_response)
+        self.done_texts.append(llm_response.completion_text)
+
+
+class NarratingToolProvider(MockProvider):
+    """Emits `narration-N` plus a tool call for N rounds, then a final answer."""
+
+    def __init__(self, rounds: int = 1, narrate: bool = True):
+        super().__init__()
+        self.rounds = rounds
+        self.narrate = narrate
+
+    async def text_chat(self, **kwargs) -> LLMResponse:
+        self.call_count += 1
+        func_tool = kwargs.get("func_tool")
+        if func_tool is None or self.call_count > self.rounds:
+            return LLMResponse(
+                role="assistant",
+                completion_text="final-answer",
+                usage=TokenUsage(input_other=1, output=1),
+            )
+        return LLMResponse(
+            role="assistant",
+            completion_text=f"narration-{self.call_count}" if self.narrate else "",
+            tools_call_name=["test_tool"],
+            tools_call_args=[{"query": "q"}],
+            tools_call_ids=[f"call_{self.call_count}"],
+            usage=TokenUsage(input_other=1, output=1),
+        )
+
+
+@pytest.mark.asyncio
+async def test_intermediate_response_hook_fires_once_for_tool_round(
+    mock_tool_executor, provider_request
+):
+    hooks = IntermediateHooks()
+    provider = NarratingToolProvider(rounds=1)
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=MockAgentContext(MagicMock())),
+        tool_executor=mock_tool_executor,
+        agent_hooks=hooks,
+    )
+
+    async for _response in runner.step():
+        pass
+    assert hooks.intermediate_texts == ["narration-1"]
+    assert hooks.done_texts == []
+    assert not runner.done()
+
+    async for _response in runner.step():
+        pass
+    assert hooks.intermediate_texts == ["narration-1"]
+    assert hooks.done_texts == ["final-answer"]
+    assert runner.done()
+
+
+@pytest.mark.asyncio
+async def test_intermediate_response_hook_fires_per_tool_round(
+    mock_tool_executor, provider_request
+):
+    hooks = IntermediateHooks()
+    provider = NarratingToolProvider(rounds=3)
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=MockAgentContext(MagicMock())),
+        tool_executor=mock_tool_executor,
+        agent_hooks=hooks,
+    )
+
+    for _ in range(3):
+        async for _response in runner.step():
+            pass
+    assert hooks.intermediate_texts == ["narration-1", "narration-2", "narration-3"]
+    assert hooks.done_texts == []
+
+    async for _response in runner.step():
+        pass
+    assert hooks.intermediate_texts == ["narration-1", "narration-2", "narration-3"]
+    assert hooks.done_texts == ["final-answer"]
+
+
+@pytest.mark.asyncio
+async def test_intermediate_response_hook_fires_for_tool_call_without_text(
+    mock_tool_executor, provider_request
+):
+    hooks = IntermediateHooks()
+    provider = NarratingToolProvider(rounds=1, narrate=False)
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=MockAgentContext(MagicMock())),
+        tool_executor=mock_tool_executor,
+        agent_hooks=hooks,
+    )
+
+    async for _response in runner.step():
+        pass
+    assert hooks.intermediate_texts == [""]
+    assert hooks.tool_start_called
+
+
+@pytest.mark.asyncio
+async def test_observer_hook_does_not_delay_streaming(
+    mock_tool_executor, provider_request
+):
+    class PacedStreamProvider(MockProvider):
+        def __init__(self):
+            super().__init__()
+            self.chunk_emitted = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def text_chat_stream(self, **kwargs):
+            yield LLMResponse(
+                role="assistant",
+                completion_text="first-chunk",
+                is_chunk=True,
+            )
+            self.chunk_emitted.set()
+            await self.release.wait()
+            yield LLMResponse(
+                role="assistant",
+                completion_text="final-answer",
+                usage=TokenUsage(input_other=1, output=1),
+            )
+
+    hooks = IntermediateHooks()
+    provider = PacedStreamProvider()
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=MockAgentContext(MagicMock())),
+        tool_executor=mock_tool_executor,
+        agent_hooks=hooks,
+        streaming=True,
+    )
+    deltas = []
+
+    async def drive():
+        async for response in runner.step():
+            if response.type == "streaming_delta":
+                deltas.append(response.data["chain"].get_plain_text())
+
+    task = asyncio.create_task(drive())
+    await asyncio.wait_for(provider.chunk_emitted.wait(), timeout=5)
+    await asyncio.sleep(0.05)
+    assert deltas == ["first-chunk"], "a registered hook must not buffer the stream"
+    provider.release.set()
+    await asyncio.wait_for(task, timeout=5)
+    assert hooks.intermediate_texts == []
+    assert hooks.done_texts == ["final-answer"]
+
+
+@pytest.mark.asyncio
+async def test_intermediate_response_hook_rewrite_reaches_llm_result_and_history(
+    mock_tool_executor, provider_request
+):
+    hooks = IntermediateHooks()
+    hooks.rewrite_intermediate = lambda text: f"clean:{text}"
+    provider = NarratingToolProvider(rounds=1)
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=MockAgentContext(MagicMock())),
+        tool_executor=mock_tool_executor,
+        agent_hooks=hooks,
+    )
+
+    responses = [response async for response in runner.step()]
+    delivered = [
+        response.data["chain"].get_plain_text()
+        for response in responses
+        if response.type == "llm_result"
+    ]
+    assert "clean:narration-1" in delivered
+    assert runner.run_context.messages[-2].content[-1].text == "clean:narration-1"
+
+
+@pytest.mark.asyncio
+async def test_intermediate_response_hook_cannot_change_executed_tool(
+    mock_tool_executor, provider_request
+):
+    hooks = IntermediateHooks()
+    hooks.clear_tool_calls = True
+    provider = NarratingToolProvider(rounds=1)
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=MockAgentContext(MagicMock())),
+        tool_executor=mock_tool_executor,
+        agent_hooks=hooks,
+    )
+
+    async for _response in runner.step():
+        pass
+    assert hooks.tool_start_called, "the tool call decided before the hook still runs"
+    assert runner.run_context.messages[-2].tool_calls, (
+        "history keeps the executed tool call, not the hook's edit"
+    )
+    assert not runner.done()
+
+
+@pytest.mark.asyncio
+async def test_intermediate_response_hook_exception_does_not_break_round(
+    mock_tool_executor, provider_request
+):
+    hooks = IntermediateHooks()
+    hooks.raise_in_intermediate = True
+    provider = NarratingToolProvider(rounds=1)
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=provider,
+        request=provider_request,
+        run_context=ContextWrapper(context=MockAgentContext(MagicMock())),
+        tool_executor=mock_tool_executor,
+        agent_hooks=hooks,
+    )
+
+    responses = [response async for response in runner.step()]
+    assert hooks.intermediate_texts == ["narration-1"]
+    assert hooks.tool_start_called
+    assert any(
+        response.type == "llm_result"
+        and response.data["chain"].get_plain_text() == "narration-1"
+        for response in responses
+    )
+
+
+@pytest.mark.asyncio
+async def test_main_agent_dispatches_intermediate_response_event(monkeypatch):
+    from astrbot.core.astr_agent_hooks import MainAgentHooks
+    from astrbot.core.star.star_handler import EventType
+
+    event = MagicMock()
+    llm_response = LLMResponse(
+        role="assistant",
+        completion_text="intermediate response",
+        tools_call_name=["test_tool"],
+        tools_call_args=[{"query": "test"}],
+        tools_call_ids=["call_123"],
+    )
+    call_event_hook = AsyncMock()
+    monkeypatch.setattr(
+        "astrbot.core.astr_agent_hooks.call_event_hook", call_event_hook
+    )
+
+    await MainAgentHooks().on_agent_response(
+        ContextWrapper(context=MockAgentContext(event)), llm_response
+    )
+
+    call_event_hook.assert_awaited_once_with(
+        event, EventType.OnLLMResponseIntermediateEvent, llm_response
+    )
